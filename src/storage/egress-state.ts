@@ -87,6 +87,11 @@ export interface EgressViewRow {
     /** The kernel-space role (rebuild needs it; the diff keys on msgid so a
      *  role-only drift is impossible — kernel ids are one-shot). */
     role?: string;
+    /** First-observed wall clock (epoch ms) — stamped on the message's I row
+     *  (#7579 D3). A msgid is inserted exactly once (kernel ids are one-shot),
+     *  so the I row IS the first observation; spine rows inherit it. Optional:
+     *  pre-#7579 dev rows (the tables never shipped) lack it. */
+    ts?: number;
 }
 
 type EgressOpType = "B" | "I" | "D" | "U";
@@ -108,10 +113,22 @@ function nextSeqs(db: SqliteDatabase, sessionId: string): { opSeq: number; num: 
     // compaction, so the flow maxima ARE the session's high-waters: the
     // op_seq ordering cursor and the canonical message-number cursor (I
     // rows only — B/D/U carry NULL and never advance it).
+    // #7579: the block lifecycle log (egress_block_flow) shares the SAME
+    // op_seq append clock as egress_flow (one turn writes both logs), so the
+    // op_seq cursor is the MAX over BOTH tables — a block-only turn advances
+    // the clock, and a later message-only turn must continue past it. The
+    // log_seq (canonical message number) stays egress_flow-only: block rows
+    // carry no numbers.
     const row = db
         .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o, COALESCE(MAX(log_seq), 0) AS n FROM egress_flow WHERE session_id = ?")
         .get(sessionId) as { o: number; n: number } | undefined;
-    return { opSeq: (row?.o ?? 0) + 1, num: (row?.n ?? 0) + 1 };
+    const block = db
+        .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o FROM egress_block_flow WHERE session_id = ?")
+        .get(sessionId) as { o: number } | undefined;
+    return {
+        opSeq: Math.max(Number(row?.o ?? 0), Number(block?.o ?? 0)) + 1,
+        num: Number(row?.n ?? 0) + 1,
+    };
 }
 
 interface InsertOp {
@@ -123,6 +140,9 @@ interface InsertOp {
     typeTag: string;
     bytes: string;
     role?: string;
+    /** First-observed wall clock (epoch ms) — stamped by recordEgressTurn
+     *  (#7579 D3); the I row is the message's birth, so this is its ts. */
+    ts?: number;
 }
 interface DeleteOp {
     type: "D";
@@ -163,6 +183,7 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[]): EgressView
             num += 1;
             const entry: EgressViewRow = { num, msgid: op.msgid, ref: op.ref, tokens: op.tokens, type: op.typeTag, bytes: op.bytes };
             if (op.role !== undefined) entry.role = op.role;
+            if (op.ts !== undefined) entry.ts = op.ts;
             view.splice(at + 1, 0, entry);
         } else if (op.type === "D") {
             const s = idxOf(op.start);
@@ -272,7 +293,7 @@ export function egressStateAppend(
             if (op.type === "I") {
                 rowType = "I";
                 msgid = op.msgid;
-                payload = JSON.stringify({ after: op.after, ref: op.ref, tokens: op.tokens, type: op.typeTag, role: op.role });
+                payload = JSON.stringify({ after: op.after, ref: op.ref, tokens: op.tokens, type: op.typeTag, role: op.role, ts: op.ts });
                 bytes = op.bytes;
                 num += 1;
                 logSeq = num;
@@ -412,6 +433,7 @@ function applyOps(sessionId: string, rows: EgressStateRow[]): EgressViewRow[] {
                 bytes: row.bytes,
             };
             if (p.role !== undefined) entry.role = p.role as string;
+            if (typeof p.ts === "number") entry.ts = p.ts;
             if (p.after == null) {
                 view.push(entry);
             } else if (typeof p.after !== "string") {
